@@ -34,8 +34,9 @@ var (
 
 // TODO: подумать над значениями констант
 const (
-	putBufSise     = 10                      // когда клиент (методы Get,MGet,...) сам сходил в db он обязан поделиться свежими
-	mputBufSize    = 10                      // данными с кэшем через канал put(mput,...). Чтобы клиент не ждал, эти каналы буферизируются.
+	putBufSise     = 10 // когда клиент (методы Get,MGet,...) сам сходил в db он обязан поделиться свежими
+	mputBufSize    = 10 // данными с кэшем через канал put(mput,...). Чтобы клиент не ждал, эти каналы буферизируются.
+	putKeysBufSize = 10
 	requestTimeout = 200 * time.Millisecond  // метод Get не ждет ответа кэша больше этого времени
 	cacheTTL       = 1000 * time.Millisecond // время актуальности кэша (устное вводное из ролика)
 	keyTTL         = 4 * time.Hour           // при обновлении кэша запись будет удалена, если в течении этого время никто ее не запрашивал
@@ -44,7 +45,7 @@ const (
 
 type getResponse struct {
 	key    string // WTF: мы где нибудь используем это поле? Если нет, зачем здесь эти лишние 16 байт?
-	val    string // WTF: IPv4=4byte, почему строка? - нам приходит/уходит строка. Это одна и тажа строка, а при конвертации мы будем плодить новые строки.
+	val    string // WTF: IPv4=4byte, почему строка? - нам приходит/уходит строка. Это одна и таже строка, а при конвертации мы будем плодить новые строки.
 	err    error
 	expire time.Time // WTF: Time это (по крайней мере) 24 байт. Может хватит int64?
 }
@@ -72,6 +73,9 @@ type Cache struct {
 	put     chan *getResponse
 	mget    chan *mgetRequest
 	mput    chan *mgetResponse
+	getKeys chan (chan []string)
+	putKeys chan []string
+	keys    []string
 	cache   map[string]*getResponse
 	roCache map[string]*getResponse // сюда премещается кэш на время обновления
 }
@@ -79,14 +83,16 @@ type Cache struct {
 func Open(ctx context.Context, db KVDatabase) *Cache {
 	ctx, cancel := context.WithCancelCause(ctx)
 	c := &Cache{
-		ctx:    ctx,
-		cancel: cancel,
-		db:     db,
-		get:    make(chan *getRequest),
-		put:    make(chan *getResponse, putBufSise), // буфер, чтобы не задерживать клиента
-		mget:   make(chan *mgetRequest),
-		mput:   make(chan *mgetResponse, mputBufSize),
-		cache:  make(map[string]*getResponse, presetСacheCap),
+		ctx:     ctx,
+		cancel:  cancel,
+		db:      db,
+		get:     make(chan *getRequest),
+		put:     make(chan *getResponse, putBufSise), // буфер, чтобы не задерживать клиента
+		mget:    make(chan *mgetRequest),
+		mput:    make(chan *mgetResponse, mputBufSize),
+		getKeys: make(chan (chan []string)),
+		putKeys: make(chan []string, putKeysBufSize),
+		cache:   make(map[string]*getResponse, presetСacheCap),
 	}
 	go c.serve()
 	return c
@@ -128,14 +134,27 @@ func (c *Cache) Get(key string) (string, error) {
 	return val, err
 }
 
+func clone[T any](a []T) []T { return append([]T{}, a...) }
+
 func (c *Cache) Keys() ([]string, error) {
 	if err := context.Cause(c.ctx); err != nil {
 		return nil, err
 	}
 
-	// TODO: можно организовать кэширование ответа на время cacheTTL
+	ch := make(chan []string)
+	c.getKeys <- ch
+	if keys := <-ch; keys != nil {
+		return keys, nil
+	}
 
-	return c.db.Keys() // 100ms
+	keys, err := c.db.Keys() // 100ms
+	if err != nil {
+		return keys, err
+	}
+
+	c.putKeys <- clone(keys)
+
+	return keys, err
 }
 
 func (c *Cache) MGet(keys []string) ([]*string, error) {
@@ -164,7 +183,7 @@ func (c *Cache) MGet(keys []string) ([]*string, error) {
 		return vals, err
 	}
 
-	c.mput <- &mgetResponse{keys, vals}
+	c.mput <- &mgetResponse{keys, clone(vals)}
 
 	return vals, err
 }
@@ -210,6 +229,7 @@ loop:
 			break loop
 
 		case <-tk.C:
+			c.keys = nil
 			if isUpdating {
 				log.Printf("%s: cache update was skipped because it is already in progress", op)
 				continue loop
@@ -273,9 +293,10 @@ loop:
 				rec.expire = expire
 
 				if rec.err == nil {
-					vals[i] = &rec.val
+					vals[i] = func(s string) *string { return &s }(rec.val)
 				}
 			}
+
 			req.out <- vals
 
 		case resp := <-c.mput:
@@ -296,6 +317,16 @@ loop:
 					}
 				}
 			}
+
+		case reqOut := <-c.getKeys:
+			if len(c.keys) == 0 {
+				reqOut <- nil
+				continue loop
+			}
+			reqOut <- append([]string{}, c.keys...)
+
+		case keys := <-c.putKeys:
+			c.keys = keys
 		}
 	}
 }
